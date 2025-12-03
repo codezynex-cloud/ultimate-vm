@@ -1,0 +1,662 @@
+#!/bin/bash
+# ============================================================================
+# LINUX VM MANAGER v5.0
+# Lightweight Linux VM Management with Separate RDP
+# Optimized for Limited Storage
+# ============================================================================
+
+set -eo pipefail
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+readonly VM_VERSION="5.0.0"
+readonly VM_DIR="${VM_DIR:-$HOME/vms}"
+readonly ISO_DIR="$VM_DIR/isos"
+readonly DISK_DIR="$VM_DIR/disks"
+readonly SCRIPT_DIR="$VM_DIR/scripts"
+readonly LOG_DIR="$VM_DIR/logs"
+
+# Create minimal directories
+mkdir -p "$VM_DIR" "$ISO_DIR" "$DISK_DIR" "$SCRIPT_DIR" "$LOG_DIR"
+
+# ============================================================================
+# COLOR SYSTEM
+# ============================================================================
+readonly C_BLACK="\033[0;30m"
+readonly C_RED="\033[0;31m"
+readonly C_GREEN="\033[0;32m"
+readonly C_YELLOW="\033[0;33m"
+readonly C_BLUE="\033[0;34m"
+readonly C_MAGENTA="\033[0;35m"
+readonly C_CYAN="\033[0;36m"
+readonly C_WHITE="\033[1;37m"
+readonly C_RESET="\033[0m"
+
+# ============================================================================
+# LINUX OS DATABASE (Optimized for Small Space)
+# ============================================================================
+declare -A LINUX_OS_DB=(
+    # Small Linux Distros
+    ["alpine"]="Alpine Linux|https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-3.19.0-x86_64.iso|root|alpine"
+    ["tinycore"]="Tiny Core Linux|http://tinycorelinux.net/13.x/x86_64/release/TinyCorePure64-13.0.iso|tc|tc"
+    ["slitaz"]="SliTaz Rolling|http://mirror.slitaz.org/iso/rolling/slitaz-rolling-core64.iso|root|root"
+    ["puppy"]="Puppy Linux|http://distro.ibiblio.org/puppylinux/puppy-fossa/fossapup64-9.5.iso|root|linux"
+    
+    # Cloud Images (Small)
+    ["ubuntu-mini"]="Ubuntu Minimal|https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-amd64.img|ubuntu|ubuntu"
+    ["debian-net"]="Debian Netinstall|https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.5.0-amd64-netinst.iso|debian|debian"
+)
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_DIR/vm-manager.log"
+}
+
+print_success() {
+    echo -e "${C_GREEN}✅ $1${C_RESET}"
+    log_msg "SUCCESS: $1"
+}
+
+print_error() {
+    echo -e "${C_RED}❌ $1${C_RESET}"
+    log_msg "ERROR: $1"
+}
+
+print_info() {
+    echo -e "${C_CYAN}ℹ️  $1${C_RESET}"
+    log_msg "INFO: $1"
+}
+
+print_warning() {
+    echo -e "${C_YELLOW}⚠️  $1${C_RESET}"
+    log_msg "WARNING: $1"
+}
+
+# ============================================================================
+# BANNER
+# ============================================================================
+show_banner() {
+    clear
+    echo -e "${C_CYAN}"
+    cat << "EOF"
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║     ██╗     ██╗███╗   ██╗██╗   ██╗██╗  ██╗    ██╗   ██╗███╗  ║
+║     ██║     ██║████╗  ██║██║   ██║╚██╗██╔╝    ██║   ██║████╗ ║
+║     ██║     ██║██╔██╗ ██║██║   ██║ ╚███╔╝     ██║   ██║██╔██╗║
+║     ██║     ██║██║╚██╗██║██║   ██║ ██╔██╗     ██║   ██║██║╚██╗║
+║     ███████╗██║██║ ╚████║╚██████╔╝██╔╝ ██╗    ╚██████╔╝██║ ╚██╗║
+║     ╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝     ╚═════╝ ╚═╝  ╚═╝║
+║                                                              ║
+║                    Linux VM Manager v${VM_VERSION}             ║
+║               Lightweight • Fast • Efficient                 ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${C_RESET}"
+}
+
+# ============================================================================
+# CHECK DEPENDENCIES
+# ============================================================================
+check_deps() {
+    print_info "Checking dependencies..."
+    
+    local deps=("qemu-system-x86_64" "qemu-img" "wget")
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        print_error "Missing: ${missing[*]}"
+        
+        if command -v apt &>/dev/null; then
+            print_info "Installing dependencies..."
+            sudo apt update
+            sudo apt install -y qemu-system qemu-utils wget
+        else
+            print_error "Please install manually: ${missing[*]}"
+            exit 1
+        fi
+    fi
+    
+    # Check available space
+    local available_space=$(df "$VM_DIR" | awk 'NR==2 {print $4}')
+    if [[ "$available_space" -lt 1000000 ]]; then
+        print_warning "Low disk space available ($available_space KB)"
+        print_info "Using lightweight Linux distributions only"
+    fi
+    
+    print_success "Dependencies satisfied"
+}
+
+# ============================================================================
+# CREATE LINUX VM
+# ============================================================================
+create_linux_vm() {
+    show_banner
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}                    CREATE LINUX VM                          ${C_RESET}"
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    
+    # VM Name
+    read -rp "$(echo -e "${C_GREEN}📝 Enter VM name: ${C_RESET}")" vm_name
+    
+    if [[ -z "$vm_name" ]]; then
+        print_error "VM name cannot be empty"
+        return 1
+    fi
+    
+    if [[ -f "$SCRIPT_DIR/start-$vm_name.sh" ]]; then
+        print_error "VM '$vm_name' already exists"
+        return 1
+    fi
+    
+    # OS Selection
+    echo -e "${C_CYAN}Select Linux Distribution:${C_RESET}"
+    echo ""
+    local i=1
+    declare -A os_options
+    
+    for os_key in "${!LINUX_OS_DB[@]}"; do
+        IFS='|' read -r os_name os_url os_user os_pass <<< "${LINUX_OS_DB[$os_key]}"
+        os_options[$i]="$os_key"
+        echo -e "  ${C_GREEN}$i)${C_RESET} $os_name"
+        ((i++))
+    done
+    
+    echo ""
+    read -rp "$(echo -e "${C_GREEN}Select OS (1-$((i-1))): ${C_RESET}")" os_choice
+    
+    local os_key="${os_options[$os_choice]}"
+    
+    if [[ -z "$os_key" ]]; then
+        print_error "Invalid selection"
+        return 1
+    fi
+    
+    IFS='|' read -r os_name os_url os_user os_pass <<< "${LINUX_OS_DB[$os_key]}"
+    
+    # Configuration
+    echo ""
+    echo -e "${C_CYAN}VM Configuration:${C_RESET}"
+    
+    read -rp "$(echo -e "${C_GREEN}💻 CPU cores (1-4, default: 1): ${C_RESET}")" cpu_cores
+    cpu_cores=${cpu_cores:-1}
+    
+    read -rp "$(echo -e "${C_GREEN}🧠 RAM in MB (256-2048, default: 512): ${C_RESET}")" memory_mb
+    memory_mb=${memory_mb:-512}
+    
+    read -rp "$(echo -e "${C_GREEN}💾 Disk size (2G-20G, default: 5G): ${C_RESET}")" disk_size
+    disk_size=${disk_size:-5G}
+    
+    # Network
+    echo ""
+    echo -e "${C_CYAN}🌐 Network Configuration:${C_RESET}"
+    echo "  1) NAT (Default)"
+    echo "  2) User Networking"
+    
+    read -rp "$(echo -e "${C_GREEN}Select network (1-2): ${C_RESET}")" net_type
+    net_type=${net_type:-1}
+    
+    # Download OS
+    print_info "Downloading $os_name..."
+    
+    local iso_file="$ISO_DIR/$(basename "$os_url")"
+    local disk_file="$DISK_DIR/$vm_name.qcow2"
+    
+    # Check if already downloaded
+    if [[ ! -f "$iso_file" ]]; then
+        if wget -q --show-progress -O "$iso_file" "$os_url"; then
+            print_success "Downloaded successfully"
+        else
+            print_error "Download failed"
+            return 1
+        fi
+    else
+        print_info "Using cached image"
+    fi
+    
+    # Create disk
+    print_info "Creating virtual disk..."
+    
+    if [[ "$os_url" == *.qcow2 ]] || [[ "$os_url" == *.img ]]; then
+        cp "$iso_file" "$disk_file"
+        qemu-img resize "$disk_file" "$disk_size" 2>/dev/null || true
+    else
+        qemu-img create -f qcow2 "$disk_file" "$disk_size"
+    fi
+    
+    # Create startup script
+    create_vm_script "$vm_name" "$cpu_cores" "$memory_mb" "$net_type"
+    
+    print_success "✅ Linux VM '$vm_name' created!"
+    echo ""
+    echo -e "${C_CYAN}Quick Start:${C_RESET}"
+    echo -e "  ${C_GREEN}Start:${C_RESET}     ./start-$vm_name.sh"
+    echo -e "  ${C_GREEN}SSH:${C_RESET}       ssh $os_user@localhost -p 2222"
+    echo -e "  ${C_GREEN}Stop:${C_RESET}      pkill -f \"qemu-system.*$vm_name\""
+}
+
+# ============================================================================
+# CREATE VM STARTUP SCRIPT
+# ============================================================================
+create_vm_script() {
+    local vm_name="$1"
+    local cpu_cores="$2"
+    local memory_mb="$3"
+    local net_type="$4"
+    
+    local script_file="$SCRIPT_DIR/start-$vm_name.sh"
+    local disk_file="$DISK_DIR/$vm_name.qcow2"
+    
+    cat > "$script_file" << EOF
+#!/bin/bash
+# Linux VM: $vm_name
+# Auto-generated startup script
+
+VM_NAME="$vm_name"
+DISK_FILE="$disk_file"
+CPU_CORES=$cpu_cores
+MEMORY_MB=$memory_mb
+
+echo "Starting Linux VM: \$VM_NAME"
+
+# Check KVM
+if [[ -e /dev/kvm ]]; then
+    KVM_OPTS="-enable-kvm -cpu host"
+else
+    KVM_OPTS="-cpu qemu64"
+fi
+
+# Build command
+CMD="qemu-system-x86_64 \$KVM_OPTS"
+CMD+=" -name \$VM_NAME"
+CMD+=" -smp \$CPU_CORES"
+CMD+=" -m \$MEMORY_MB"
+
+# Disk
+CMD+=" -drive file=\$DISK_FILE,if=virtio"
+
+# Network
+case "$net_type" in
+    1)
+        # NAT
+        CMD+=" -netdev user,id=net0"
+        CMD+=" -device virtio-net-pci,netdev=net0"
+        ;;
+    2)
+        # User networking with SSH forward
+        CMD+=" -netdev user,id=net0,hostfwd=tcp::2222-:22"
+        CMD+=" -device virtio-net-pci,netdev=net0"
+        ;;
+esac
+
+# Display (minimal)
+CMD+=" -nographic"
+CMD+=" -serial mon:stdio"
+
+# Boot
+CMD+=" -boot order=c"
+
+echo "Starting VM..."
+echo "Command: \${CMD:0:80}..."
+
+eval "\$CMD"
+EOF
+    
+    # Create simple launcher
+    cat > "./start-$vm_name.sh" << EOF
+#!/bin/bash
+bash "$script_file"
+EOF
+    
+    chmod +x "$script_file" "./start-$vm_name.sh"
+    print_info "Startup script created: ./start-$vm_name.sh"
+}
+
+# ============================================================================
+# LIST VMs
+# ============================================================================
+list_vms() {
+    show_banner
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}                     VIRTUAL MACHINES                         ${C_RESET}"
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    
+    local vms=($(ls "$SCRIPT_DIR"/start-*.sh 2>/dev/null | xargs -n1 basename | sed 's/start-//;s/.sh//'))
+    
+    if [[ ${#vms[@]} -eq 0 ]]; then
+        print_warning "No virtual machines found"
+        return
+    fi
+    
+    echo -e "${C_GREEN}Available VMs:${C_RESET}"
+    echo -e "${C_BLUE}══════════════════════════════════════════════════════════════${C_RESET}"
+    
+    for vm in "${vms[@]}"; do
+        # Check if running
+        local status="${C_RED}stopped${C_RESET}"
+        if pgrep -f "qemu-system.*$vm" > /dev/null; then
+            status="${C_GREEN}running${C_RESET}"
+        fi
+        
+        echo -e "  ${C_YELLOW}•${C_RESET} $vm [$status]"
+    done
+    
+    echo ""
+    echo -e "${C_CYAN}Total VMs:${C_RESET} ${#vms[@]}"
+}
+
+# ============================================================================
+# START VM
+# ============================================================================
+start_vm() {
+    list_vms
+    echo ""
+    
+    read -rp "$(echo -e "${C_GREEN}Enter VM name to start: ${C_RESET}")" vm_name
+    
+    if [[ -f "$SCRIPT_DIR/start-$vm_name.sh" ]]; then
+        print_info "Starting VM: $vm_name"
+        bash "$SCRIPT_DIR/start-$vm_name.sh"
+    elif [[ -f "./start-$vm_name.sh" ]]; then
+        print_info "Starting VM: $vm_name"
+        bash "./start-$vm_name.sh"
+    else
+        print_error "VM '$vm_name' not found"
+    fi
+}
+
+# ============================================================================
+# STOP VM
+# ============================================================================
+stop_vm() {
+    echo -e "${C_YELLOW}Running VMs:${C_RESET}"
+    ps aux | grep "[q]emu-system" | awk '{printf "  [%s] %s\n", $2, $13}'
+    
+    echo ""
+    read -rp "$(echo -e "${C_GREEN}Enter PID to stop (or Enter to cancel): ${C_RESET}")" pid
+    
+    if [[ -n "$pid" ]]; then
+        if kill "$pid"; then
+            print_success "VM stopped"
+        else
+            print_error "Failed to stop VM"
+        fi
+    fi
+}
+
+# ============================================================================
+# DELETE VM
+# ============================================================================
+delete_vm() {
+    list_vms
+    echo ""
+    
+    read -rp "$(echo -e "${C_GREEN}Enter VM name to delete: ${C_RESET}")" vm_name
+    
+    # Confirm
+    read -rp "$(echo -e "${C_RED}Type 'DELETE' to confirm: ${C_RESET}")" confirm
+    
+    if [[ "$confirm" != "DELETE" ]]; then
+        print_info "Deletion cancelled"
+        return
+    fi
+    
+    # Stop if running
+    local pid=$(pgrep -f "qemu-system.*$vm_name")
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+    
+    # Remove files
+    rm -f "$DISK_DIR/$vm_name.qcow2"
+    rm -f "$SCRIPT_DIR/start-$vm_name.sh"
+    rm -f "./start-$vm_name.sh"
+    
+    print_success "VM '$vm_name' deleted"
+}
+
+# ============================================================================
+# RDP SETUP (SEPARATE OPTION)
+# ============================================================================
+setup_rdp() {
+    show_banner
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}                     RDP SERVER SETUP                         ${C_RESET}"
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    
+    print_info "This will install XRDP for remote desktop access"
+    echo ""
+    echo -e "${C_YELLOW}⚠️  Requirements:${C_RESET}"
+    echo "  • Ubuntu/Debian system"
+    echo "  • Minimum 1GB free space"
+    echo "  • Stable internet connection"
+    echo ""
+    
+    read -rp "$(echo -e "${C_GREEN}Continue with RDP setup? (Y/n): ${C_RESET}")" continue_rdp
+    
+    if [[ "$continue_rdp" =~ ^[Nn]$ ]]; then
+        return
+    fi
+    
+    # Update system
+    print_info "Updating system packages..."
+    sudo apt update && sudo apt upgrade -y
+    
+    # Install XRDP
+    print_info "Installing XRDP and XFCE..."
+    sudo apt install xfce4 xfce4-goodies xrdp -y
+    
+    # Configure XRDP
+    print_info "Configuring XRDP..."
+    echo "startxfce4" > ~/.xsession
+    sudo chown $(whoami):$(whoami) ~/.xsession
+    
+    # Configure XRDP to use XFCE
+    sudo sed -i 's/use_vsock=true/use_vsock=false/g' /etc/xrdp/xrdp.ini
+    sudo sed -i 's/port=3389/port=3390/g' /etc/xrdp/xrdp.ini  # Use different port
+    
+    # Start services
+    print_info "Starting RDP services..."
+    sudo systemctl enable xrdp
+    sudo systemctl restart xrdp
+    
+    # Get IP
+    local ip_address=$(hostname -I | awk '{print $1}')
+    if [[ -z "$ip_address" ]]; then
+        ip_address="localhost"
+    fi
+    
+    print_success "✅ RDP SERVER SETUP COMPLETE!"
+    echo ""
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_GREEN}Connection Details:${C_RESET}"
+    echo -e "  ${C_YELLOW}IP Address:${C_RESET}   $ip_address"
+    echo -e "  ${C_YELLOW}Port:${C_RESET}         3390"
+    echo -e "  ${C_YELLOW}Protocol:${C_RESET}     RDP over TCP"
+    echo -e "  ${C_YELLOW}Username:${C_RESET}     $(whoami)"
+    echo -e "  ${C_YELLOW}Password:${C_RESET}     Your system password"
+    echo ""
+    echo -e "${C_CYAN}How to Connect:${C_RESET}"
+    echo "1. Windows: Remote Desktop Connection"
+    echo "2. Linux: xfreerdp /v:$ip_address:3390"
+    echo "3. Android: Microsoft Remote Desktop app"
+    echo ""
+    echo -e "${C_YELLOW}Note:${C_RESET} Make sure port 3390 is accessible"
+}
+
+# ============================================================================
+# SYSTEM INFO
+# ============================================================================
+system_info() {
+    show_banner
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}                     SYSTEM INFORMATION                       ${C_RESET}"
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    
+    # System info
+    echo -e "${C_GREEN}System:${C_RESET}"
+    echo -e "  OS: $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+    echo -e "  Kernel: $(uname -r)"
+    echo -e "  Architecture: $(uname -m)"
+    
+    # Resources
+    echo ""
+    echo -e "${C_GREEN}Resources:${C_RESET}"
+    
+    # CPU
+    local cpu_cores=$(nproc)
+    echo -e "  CPU Cores: $cpu_cores"
+    
+    # Memory
+    local mem_total=$(free -m | awk '/Mem:/ {print $2}')
+    local mem_used=$(free -m | awk '/Mem:/ {print $3}')
+    echo -e "  Memory: ${mem_used}MB / ${mem_total}MB"
+    
+    # Disk
+    local disk_total=$(df -h / | awk 'NR==2 {print $2}')
+    local disk_used=$(df -h / | awk 'NR==2 {print $3}')
+    local disk_percent=$(df -h / | awk 'NR==2 {print $5}')
+    echo -e "  Disk: ${disk_used} / ${disk_total} ($disk_percent)"
+    
+    # VM Directory
+    echo ""
+    echo -e "${C_GREEN}VM Manager:${C_RESET}"
+    echo -e "  Version: $VM_VERSION"
+    echo -e "  VM Directory: $VM_DIR"
+    echo -e "  Total VMs: $(ls "$SCRIPT_DIR"/start-*.sh 2>/dev/null | wc -l)"
+    
+    # KVM Status
+    echo ""
+    echo -e "${C_GREEN}Virtualization:${C_RESET}"
+    if [[ -e /dev/kvm ]]; then
+        echo -e "  KVM: ${C_GREEN}Available${C_RESET}"
+    else
+        echo -e "  KVM: ${C_RED}Not Available${C_RESET}"
+    fi
+}
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+cleanup_system() {
+    show_banner
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo -e "${C_CYAN}                     SYSTEM CLEANUP                           ${C_RESET}"
+    echo -e "${C_CYAN}══════════════════════════════════════════════════════════════${C_RESET}"
+    echo ""
+    
+    print_warning "⚠️  This will free up disk space by removing cached files"
+    echo ""
+    
+    echo "1) Clear ISO cache"
+    echo "2) Remove all VMs"
+    echo "3) Remove logs"
+    echo "0) Back"
+    
+    read -rp "$(echo -e "${C_GREEN}Select option: ${C_RESET}")" choice
+    
+    case $choice in
+        1)
+            local cache_size=$(du -sh "$ISO_DIR" | cut -f1)
+            rm -rf "$ISO_DIR"/*
+            mkdir -p "$ISO_DIR"
+            print_success "Cleared ISO cache ($cache_size freed)"
+            ;;
+        2)
+            read -rp "$(echo -e "${C_RED}Remove ALL VMs? (type 'YES'): ${C_RESET}")" confirm
+            if [[ "$confirm" == "YES" ]]; then
+                rm -rf "$DISK_DIR"/* "$SCRIPT_DIR"/*
+                print_success "All VMs removed"
+            fi
+            ;;
+        3)
+            rm -f "$LOG_DIR"/*
+            print_success "Logs cleared"
+            ;;
+    esac
+}
+
+# ============================================================================
+# MAIN MENU
+# ============================================================================
+main_menu() {
+    while true; do
+        show_banner
+        
+        # Show disk usage
+        local disk_usage=$(du -sh "$VM_DIR" 2>/dev/null | cut -f1)
+        local vm_count=$(ls "$SCRIPT_DIR"/start-*.sh 2>/dev/null | wc -l)
+        
+        echo -e "${C_CYAN}Status:${C_RESET}"
+        echo -e "  VMs: $vm_count"
+        echo -e "  Disk: $disk_usage"
+        echo ""
+        
+        echo -e "${C_CYAN}Main Menu:${C_RESET}"
+        echo -e "${C_BLUE}══════════════════════════════════════════════════════════════${C_RESET}"
+        echo ""
+        echo -e "  ${C_GREEN}1)${C_RESET} 🚀 Create Linux VM"
+        echo -e "  ${C_GREEN}2)${C_RESET} 📋 List VMs"
+        echo -e "  ${C_GREEN}3)${C_RESET} ▶️  Start VM"
+        echo -e "  ${C_GREEN}4)${C_RESET} ⏹️  Stop VM"
+        echo -e "  ${C_GREEN}5)${C_RESET} 🗑️  Delete VM"
+        echo -e "  ${C_GREEN}6)${C_RESET} 🖥️  Setup RDP Server"
+        echo -e "  ${C_GREEN}7)${C_RESET} 📊 System Info"
+        echo -e "  ${C_GREEN}8)${C_RESET} 🧹 Cleanup"
+        echo -e "  ${C_RED}0)${C_RESET} 🚪 Exit"
+        echo ""
+        echo -e "${C_BLUE}══════════════════════════════════════════════════════════════${C_RESET}"
+        
+        read -rp "$(echo -e "${C_GREEN}Select option (0-8): ${C_RESET}")" choice
+        
+        case $choice in
+            1) create_linux_vm ;;
+            2) list_vms ;;
+            3) start_vm ;;
+            4) stop_vm ;;
+            5) delete_vm ;;
+            6) setup_rdp ;;
+            7) system_info ;;
+            8) cleanup_system ;;
+            0)
+                echo ""
+                print_success "Thank you for using Linux VM Manager!"
+                exit 0
+                ;;
+            *)
+                print_error "Invalid option"
+                ;;
+        esac
+        
+        echo ""
+        read -rp "$(echo -e "${C_CYAN}Press Enter to continue...${C_RESET}")"
+    done
+}
+
+# ============================================================================
+# MAIN
+# ============================================================================
+main() {
+    # Check dependencies
+    check_deps
+    
+    # Start main menu
+    main_menu
+}
+
+# Run script
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
